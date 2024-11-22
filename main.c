@@ -1,90 +1,234 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <termios.h>
 
-// Function to read and parse a command from standard input
-// `cmd` will store the command name
-// `par` will store the command parameters
-void read_command(char cmd[], char *par[]) {
-    char line[1024];       // Buffer to store the input line
-    int count = 0, i = 0;  // Counters for line length and number of parameters
-    char *array[100], *pch;
+#define MAX_COMMAND_LENGTH 1024
+#define MAX_ARGS 100
+#define MAX_PIPES 10
+#define HIST_SIZE 20
 
-    // Read the input line character by character
-    while (1) {
-        int c = fgetc(stdin);  // Read character by character
-        if (c == EOF || c == '\n') break; // Stop when EOF or newline is encountered
-        line[count++] = (char)c; // Store the character in the buffer
-    }
+char *history[HIST_SIZE];
+int history_index = 0;
+int history_pos = 0;
 
-    // Null-terminate the input line
-    line[count] = '\0';
-
-    // If the line is empty, return immediately
-    if (count == 0) return;
-
-    // Tokenize the line to separate the command and its parameters
-    pch = strtok(line, " \n");
-    while (pch != NULL) {
-        array[i++] = strdup(pch); // Copy each token into an array
-        pch = strtok(NULL, " \n"); // Get the next token
-    }
-
-    // Copy the command name into `cmd`
-    strcpy(cmd, array[0]);
-
-    // Copy the parameters into the `par` array
-    for (int j = 0; j < i; j++) {
-        par[j] = array[j];
-    }
-    par[i] = NULL; // Null-terminate the parameter array
+void handle_sigint(int sig) {
+    printf("\n^C\n$");
+    fflush(stdout);
 }
 
-// Function to display the prompt in the terminal
-void type_prompt() {
-    static int first_time = 1;  // Static variable to display the prompt only the first time
-    if (first_time) {
-        const char *CLEAR_SCREEN_ANSI = " \e[1;1H\e[2J";  // ANSI sequence to clear the screen
-        write(STDOUT_FILENO, CLEAR_SCREEN_ANSI, 12);  // Clear the screen
-        first_time = 0;  // Ensure it runs only once
+void save_history(char *command) {
+    if (command[0] == '\0') {
+        return;
     }
-    printf("shell-c> ");  // Display the prompt
+
+    free(history[history_index]);
+    history[history_index] = strdup(command);
+    history_index = (history_index + 1) % HIST_SIZE;
+    if (history_pos >= HIST_SIZE) {
+        history_pos = HIST_SIZE - 1;
+    }
+}
+
+void print_history() {
+    for (int i = 0; i < HIST_SIZE && history[i] != NULL; i++) {
+        printf("%d: %s\n", i + 1, history[i]);
+    }
+}
+
+void execute_single_command(char *command) {
+    char *args[MAX_ARGS];
+    char *token = strtok(command, " ");
+    int i = 0;
+
+    while (token != NULL && i < MAX_ARGS - 1) {
+        args[i++] = token;
+        token = strtok(NULL, " ");
+    }
+    args[i] = NULL;
+
+    if (args[0] == NULL) {
+        return;
+    }
+
+    int in_redirect = -1, out_redirect = -1;
+    for (int j = 0; args[j] != NULL; j++) {
+        if (strcmp(args[j], ">") == 0) {
+            out_redirect = open(args[j + 1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            args[j] = NULL;
+        } else if (strcmp(args[j], "<") == 0) {
+            in_redirect = open(args[j + 1], O_RDONLY);
+            args[j] = NULL;
+        }
+    }
+
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        perror("Failure creating child process");
+        return;
+    } else if (pid == 0) {
+        if (in_redirect != -1) {
+            dup2(in_redirect, STDIN_FILENO);
+            close(in_redirect);
+        }
+        if (out_redirect != -1) {
+            dup2(out_redirect, STDOUT_FILENO);
+            close(out_redirect);
+        }
+
+        if (execvp(args[0], args) == -1) {
+            perror("Failure to execute command");
+        }
+        exit(EXIT_FAILURE);
+    } else {
+        int status;
+        waitpid(pid, &status, 0);
+    }
+}
+
+void execute_piped_commands(char *commands[], int n) {
+    int pipefds[2 * (n - 1)];
+    pid_t pids[n];
+
+    for (int i = 0; i < n - 1; i++) {
+        if (pipe(pipefds + i * 2) < 0) {
+            perror("Failed to create the pipe");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        pids[i] = fork();
+        if (pids[i] == 0) {
+            if (i > 0) {
+                dup2(pipefds[(i - 1) * 2], STDIN_FILENO);
+            }
+            if (i < n - 1) {
+                dup2(pipefds[i * 2 + 1], STDOUT_FILENO);
+            }
+
+            for (int j = 0; j < 2 * (n - 1); j++) {
+                close(pipefds[j]);
+            }
+
+            execute_single_command(commands[i]);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    for (int i = 0; i < 2 * (n - 1); i++) {
+        close(pipefds[i]);
+    }
+
+    for (int i = 0; i < n; i++) {
+        waitpid(pids[i], NULL, 0);
+    }
+}
+
+void enable_raw_mode() {
+    struct termios raw;
+    tcgetattr(STDIN_FILENO, &raw);
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+}
+
+void disable_raw_mode() {
+    struct termios raw;
+    tcgetattr(STDIN_FILENO, &raw);
+    raw.c_lflag |= (ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
 }
 
 int main() {
-    char cmd[100], command[100], *parameters[20];  // Variables for the command and parameters
-    char *envp[] = {(char *) "PATH=/bin", 0};  // Define the environment with the PATH
+    signal(SIGINT, handle_sigint);
 
-    // Main shell loop
+    char command[MAX_COMMAND_LENGTH];
+
+    printf("Shell-C (Type 'exit' to leave)\n");
+
     while (1) {
-        type_prompt();  // Display the prompt
-        read_command(command, parameters);  // Read the command and parameters
+        history_pos = history_index;
 
-        // Check if the command is "exit", and if so, break out of the loop
+        enable_raw_mode();
+
+        printf("$ ");
+        fflush(stdout);
+
+        int i = 0;
+        while (1) {
+            char c = getchar();
+            if (c == 10) {
+                command[i] = '\0';
+                break;
+            } else if (c == 3) {  
+                command[0] = '\0';
+                break;
+            } else if (c == 27) { 
+                getchar();  
+                char arrow_key = getchar();
+                if (arrow_key == 'A' && history_pos > 0) {  
+                    history_pos--;
+                    strcpy(command, history[history_pos]);
+                    printf("\r$ %s", command);
+                    i = strlen(command);
+                } else if (arrow_key == 'B' && history_pos < history_index) {  
+                    history_pos++;
+                    if (history_pos < history_index) {
+                        strcpy(command, history[history_pos]);
+                        printf("\r$ %s", command);
+                    } else {
+                        command[0] = '\0';
+                        printf("\r$ ");
+                    }
+                    i = strlen(command);
+                }
+            } else if (c == 127) {  
+                if (i > 0) {
+                    i--;
+                    printf("\b \b");  
+                }
+            } else {
+                command[i++] = c;
+                printf("%c", c);
+            }
+        }
+
+        disable_raw_mode();
+
+        save_history(command);
+
         if (strcmp(command, "exit") == 0) {
+            printf("Leaving...\n");
             break;
         }
 
-        // Create a child process to execute the command
-        pid_t pid = fork();
-        if (pid != 0) {
-            // If it's the parent process, wait for the child to finish
-            wait(NULL);
-        } else {
-            // If it's the child process, execute the command
-            strcpy(cmd, "/bin/");  // Prepend "/bin/" to the command
-            strcat(cmd, command);   // Concatenate the command name
+        char *commands[MAX_PIPES];
+        int num_commands = 0;
 
-            // Execute the command using execve
-            if (execve(cmd, parameters, envp) == -1) {
-                perror("execve failed");  // Print error if execve fails
-                exit(EXIT_FAILURE);
-            }
+        char *pipe_token = strtok(command, "|");
+        while (pipe_token != NULL && num_commands < MAX_PIPES) {
+            commands[num_commands++] = pipe_token;
+            pipe_token = strtok(NULL, "|");
         }
+
+        printf("\n");
+
+        if (num_commands > 1) {
+            execute_piped_commands(commands, num_commands);
+        } else {
+            execute_single_command(commands[0]);
+        }
+
+        printf("\n");
     }
 
-    return 0;  // Exit the program
+    return 0;
 }
 
